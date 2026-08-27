@@ -3579,6 +3579,43 @@ def main():
 
     container_info = get_container_exec_info()
     if container_info:
+        # ── LOCAL POLICY: `serve` is never routed into the container ───────
+        # Architecture decision (2026-08-08): one container runs everything;
+        # the Desktop app is a REMOTE CLIENT ONLY (http://127.0.0.1:9119) and
+        # must never run a backend of its own (two writers on state.db).
+        #
+        # Upstream bug #91495: the app spawns `hermes serve` for its
+        # un-removable "This device" entry every ~30s even while the remote
+        # connection is healthy. `serve` force-sets HERMES_SERVE_HEADLESS=1
+        # (main.py ~11722), so /api/ws is never mounted, the app's WebSocket
+        # probe fails, and it retries. Under container mode each attempt is a
+        # `docker exec` the app cannot kill (foreign PID namespace), leaving a
+        # ~160 MB orphan behind. ~25 orphans fill the 8 GB OrbStack VM in under
+        # 30 min and the gateway dies with suspected_oom.
+        #
+        # Upstream fix #91592 would make `serve` work instead of blocking it —
+        # deliberately NOT adopted here: a working local backend is exactly the
+        # second writer this setup must not have.
+        #
+        # Escape hatch for a deliberate host-side serve: HERMES_DEV=1 hermes serve
+        if sys.argv[1:2] == ["serve"]:
+            print(
+                "hermes serve is disabled in container mode by local policy.\n"
+                "This machine runs a single gateway inside the 'hermes' container;\n"
+                "clients must connect remotely to http://127.0.0.1:9119.\n"
+                "See ~/.hermes/.container-mode and upstream issue #91495.\n"
+                "Override for one call: HERMES_DEV=1 hermes serve",
+                file=sys.stderr,
+            )
+            # Desktop only backs off after a backend that actually came up; an
+            # instant exit turns its retry into a hot loop (~3 attempts/second
+            # of log spam). Throttle spawned callers back to the old ~30s
+            # cadence. An interactive user (tty) still gets an immediate exit.
+            if not sys.stderr.isatty():
+                import time as _throttle_time
+
+                _throttle_time.sleep(25)
+            sys.exit(1)
         from hermes_cli.main_container import exec_in_container
 
         exec_in_container(container_info, sys.argv[1:])
