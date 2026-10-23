@@ -86,6 +86,16 @@ def _pre_dispatch_housekeeping(_sched, headless: bool) -> None:
         drain_legacy_pending()
     except Exception as _legacy_exc:
         _sched.logger.warning("Legacy Bot Chat pending drain failed: %s", _legacy_exc, exc_info=True)
+    # Bot Chat deliveries settle outside cron.delivery_queue (tools.bot_live_delivery), so a job
+    # whose firing tick saw the admission still "queued" never gets a later re-check otherwise —
+    # re-settle any job still stuck at last_status="delivery_queued" whose receipt has since
+    # landed. Never let it stop due jobs below.
+    try:
+        from cron.delivery_outcome import reconcile_stalled_bot_chat_deliveries
+        reconcile_stalled_bot_chat_deliveries()
+    except Exception as _reconcile_exc:
+        _sched.logger.warning(
+            "Stalled bot-chat delivery reconcile failed: %s", _reconcile_exc, exc_info=True)
     _sched._maybe_reap_dead_owners()
 
 
