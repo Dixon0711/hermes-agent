@@ -28,7 +28,13 @@ _LEDGER_OUTCOME = {
 
 def _settle_job_record(job_id: str, execution_id: str, delivery_error: Optional[str]) -> bool:
     """Stamp the outcome onto the job only while *execution_id* is still its current run:
-    the ledger's latest attempt for the job AND the job's latest recorded completion."""
+    the ledger's latest attempt for the job AND (agent jobs only) the job's latest recorded
+    completion. ``no_agent`` jobs never populate ``canonical_completions`` —
+    ``scheduler_bookkeeping.finish_completed_run`` only passes ``execution_id`` into
+    ``mark_job_run`` ``if not job.get('no_agent')`` — so for them the ledger fence above
+    (the job's single latest attempt) is the only fence available; requiring
+    ``canonical_completions`` too would make a ``no_agent`` job's ``delivery_queued`` status
+    permanently unsettleable."""
     from cron.executions import latest_execution
     from cron.jobs import _with_job, save_jobs
     from cron.jobs_error_text import sanitize_persisted_error
@@ -42,7 +48,7 @@ def _settle_job_record(job_id: str, execution_id: str, delivery_error: Optional[
 
     def apply(jobs, _i, job):
         completions = job.get("canonical_completions") or []
-        if not completions or completions[-1] != execution_id:
+        if not job.get("no_agent") and (not completions or completions[-1] != execution_id):
             return False
         status = job.get("last_status")
         if status == "delivery_queued":
@@ -96,3 +102,84 @@ def settle_quietly(job_id: Optional[str], execution_id: Optional[str]) -> None:
         settle_queued_delivery(job_id, execution_id)
     except Exception:
         logger.warning("Cron delivery %s: outcome write-back failed", execution_id, exc_info=True)
+
+
+def bot_chat_settled_outcome(job_id: str, execution_id: str) -> Optional[str]:
+    """``"delivered"`` once a Bot Chat admission for *execution_id* has settled, else None.
+
+    Bot Chat deliveries (``deliver=bot-chat[:<profile>]``) never go through
+    ``cron.delivery_queue`` — they are admitted directly to a profile's live owner
+    (``tools.bot_live_delivery``) and their receipt lives under
+    ``<profile_home>/runtime/bot_live_delivery/<delivery_id>.json``. ``_terminal`` above only
+    ever reads the queue, so a run whose firing tick observed the admission still ``queued``
+    (``scheduler_delivery._deliver_to_bot_chat``) never learns about a receipt that settles a
+    moment later — nothing previously re-checked it. The receipt id is derived
+    deterministically by the producer: ``sha256([source_home, job_id, execution_id,
+    target_home])`` (see ``scheduler_delivery._deliver_to_bot_chat``), so it can be
+    recomputed here without storing anything new. Checks this profile's own home and every
+    local profile (named ``bot-chat:<profile>`` targets).
+    """
+    import hashlib
+    import json
+
+    from hermes_cli.profiles import get_profile_dir, list_profile_names
+    from hermes_constants import get_hermes_home
+
+    source_home = get_hermes_home().resolve()
+    for profile_name in list_profile_names():
+        try:
+            target_home = get_profile_dir(profile_name).resolve()
+        except Exception:
+            continue
+        key = hashlib.sha256(json.dumps(
+            [str(source_home), str(job_id), str(execution_id), str(target_home)],
+            ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+        try:
+            receipt = json.loads(
+                (target_home / "runtime" / "bot_live_delivery" / f"{key}.json")
+                .read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(receipt, dict) and receipt.get("status") == "settled":
+            return "delivered"
+    return None
+
+
+def reconcile_stalled_bot_chat_deliveries() -> int:
+    """Settle every job stuck at ``last_status="delivery_queued"`` whose Bot Chat admission has
+    since reached ``"settled"``. Runs once per cron tick (``cron.scheduler_tick``), alongside
+    the legacy Bot Chat drain — the only periodic re-check this lane gets, since
+    ``settle_queued_delivery``/``settle_quietly`` above only ever fire once, at the firing run's
+    own bookkeeping. Writes through the same ``_settle_job_record`` + ``settle_delivery_outcome``
+    pair ``settle_queued_delivery`` uses (never a direct ``jobs.json``/``executions.db`` write).
+
+    Reads the execution id from ``latest_execution(job_id)``, not ``canonical_completions``:
+    the latter is never populated for ``no_agent`` jobs (see ``_settle_job_record``), and a
+    stalled ``no_agent`` job is exactly the case this sweep exists for.
+    Returns the number of jobs settled.
+    """
+    from cron.executions import latest_execution, settle_delivery_outcome
+    from cron.jobs import list_jobs
+
+    settled = 0
+    for job in list_jobs(include_disabled=True):
+        if job.get("last_status") != "delivery_queued":
+            continue
+        job_id = job.get("id")
+        if not job_id:
+            continue
+        latest = latest_execution(job_id)
+        if latest is None:
+            continue
+        execution_id = str(latest["id"])
+        if bot_chat_settled_outcome(job_id, execution_id) != "delivered":
+            continue
+        try:
+            settle_delivery_outcome(execution_id, "delivered")
+            if _settle_job_record(job_id, execution_id, None):
+                settled += 1
+        except Exception:
+            logger.warning(
+                "Stalled bot-chat delivery reconcile failed for job %s execution %s",
+                job_id, execution_id, exc_info=True)
+    return settled
